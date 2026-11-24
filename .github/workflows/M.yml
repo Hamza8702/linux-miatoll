@@ -1,0 +1,93 @@
+name: miatoll
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '*'
+
+env:
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CCACHE_DIR: /home/runner/.cache/ccache
+  CCACHE_MAXSIZE: 2G
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git libssl-dev \
+            libelf-dev pahole python3 python-is-python3 zip zstd wget \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            device-tree-compiler kmod
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          path: linux
+          fetch-depth: 1
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/ccache
+          key: ccache-sm7125-v2-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-sm7125-v2-${{ github.ref_name }}-
+            ccache-sm7125-v2-
+
+      - name: Configure kernel (defconfig + sm7125.config)
+        working-directory: linux
+        run: |
+          make -j$(nproc --all) O=out ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" defconfig
+          ./scripts/kconfig/merge_config.sh -m -O out out/.config arch/arm64/configs/sm7125.config
+          make -j$(nproc --all) O=out ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" olddefconfig
+
+      - name: Compile Image, DTBs and Modules with ccache
+        working-directory: linux
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          export CC="ccache ${CROSS_COMPILE}gcc"
+          export HOSTCC="ccache gcc"
+          export KBUILD_BUILD_USER="github-actions"
+          export KBUILD_BUILD_HOST="sm7125-builder"
+
+          ccache -M "$CCACHE_MAXSIZE"
+          ccache -z
+
+          make -j$(nproc --all) O=out ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            CC="$CC" HOSTCC="$HOSTCC" \
+            Image Image.gz dtbs modules
+
+          ccache -s
+
+      - name: Package boot and modules as ZIP
+        working-directory: linux
+        run: |
+          KVER=$(make -s -C out kernelrelease)
+          STAGE_DIR="$GITHUB_WORKSPACE/package-$KVER"
+          ZIP_NAME="sm7125-linux-$KVER-${{ github.run_number }}.zip"
+
+          mkdir -p "$STAGE_DIR/boot" "$STAGE_DIR/modules"
+
+          cp -r out/arch/arm64/boot/* "$STAGE_DIR/boot/"
+
+          make -j$(nproc --all) O=out ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            CC="ccache ${CROSS_COMPILE}gcc" \
+            INSTALL_MOD_PATH="$STAGE_DIR/modules" INSTALL_MOD_STRIP=1 modules_install
+
+          cd "$STAGE_DIR"
+          zip -ry9 "$GITHUB_WORKSPACE/$ZIP_NAME" boot modules
+
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
